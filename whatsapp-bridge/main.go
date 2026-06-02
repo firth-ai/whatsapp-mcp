@@ -408,6 +408,210 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// ---------------------------------------------------------------------------
+// FIRTH FORK · voice_capture hook
+//
+// Auto-download audios from whitelisted chats (Mateo's self-chat "Mensajes a
+// mí mismo") into automations/voice_capture/audios_raw/<msg_id>.ogg, and drop
+// a <msg_id>.ogg.chat_jid sidecar so the Python pipeline's --watch mode can
+// enforce the same scope guard.
+//
+// Allow-list comes from env var VOICE_CAPTURE_ALLOWED_CHATS (CSV of chat JIDs).
+// Target directory comes from env var VOICE_CAPTURE_AUDIOS_DIR. When unset,
+// falls back to a relative path that assumes the bridge is launched from
+// automations/whatsapp_sync/external/whatsapp-mcp/whatsapp-bridge-firth/.
+//
+// See specs/spec_voice_capture_via_whatsapp.md (Phase 2) and the ADR.
+// ---------------------------------------------------------------------------
+
+func voiceCaptureAllowedChats() map[string]struct{} {
+	raw := strings.TrimSpace(os.Getenv("VOICE_CAPTURE_ALLOWED_CHATS"))
+	out := map[string]struct{}{}
+	if raw == "" {
+		return out
+	}
+	for _, jid := range strings.Split(raw, ",") {
+		jid = strings.TrimSpace(jid)
+		if jid != "" {
+			out[jid] = struct{}{}
+		}
+	}
+	return out
+}
+
+func isVoiceCaptureChat(chatJID string) bool {
+	if chatJID == "" {
+		return false
+	}
+	allowed := voiceCaptureAllowedChats()
+	_, ok := allowed[chatJID]
+	return ok
+}
+
+func voiceCaptureAudiosDir() string {
+	raw := strings.TrimSpace(os.Getenv("VOICE_CAPTURE_AUDIOS_DIR"))
+	if raw != "" {
+		return raw
+	}
+	// Fallback assumes cwd = bridge-firth/, repo root is 5 levels up.
+	return filepath.Join("..", "..", "..", "..", "voice_capture", "audios_raw")
+}
+
+func saveVoiceCaptureAudio(client *whatsmeow.Client, msg *events.Message, logger waLog.Logger) {
+	aud := msg.Message.GetAudioMessage()
+	if aud == nil {
+		return
+	}
+	chatJID := msg.Info.Chat.String()
+	dir := voiceCaptureAudiosDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		logger.Warnf("[voice_capture] failed to mkdir %s: %v", dir, err)
+		return
+	}
+
+	downloader := &MediaDownloader{
+		URL:           aud.GetURL(),
+		DirectPath:    extractDirectPathFromURL(aud.GetURL()),
+		MediaKey:      aud.GetMediaKey(),
+		FileLength:    aud.GetFileLength(),
+		FileSHA256:    aud.GetFileSHA256(),
+		FileEncSHA256: aud.GetFileEncSHA256(),
+		MediaType:     whatsmeow.MediaAudio,
+	}
+	data, err := client.Download(context.Background(), downloader)
+	if err != nil {
+		logger.Warnf("[voice_capture] download failed for msg %s in %s: %v",
+			msg.Info.ID, chatJID, err)
+		return
+	}
+
+	audioPath := filepath.Join(dir, msg.Info.ID+".ogg")
+	if err := os.WriteFile(audioPath, data, 0644); err != nil {
+		logger.Warnf("[voice_capture] write failed at %s: %v", audioPath, err)
+		return
+	}
+
+	sidecarPath := audioPath + ".chat_jid"
+	if err := os.WriteFile(sidecarPath, []byte(chatJID), 0644); err != nil {
+		logger.Warnf("[voice_capture] sidecar write failed at %s: %v", sidecarPath, err)
+	}
+
+	absPath, _ := filepath.Abs(audioPath)
+	fmt.Printf("[voice_capture] saved %d bytes -> %s (chat %s)\n",
+		len(data), absPath, chatJID)
+}
+
+// ---------------------------------------------------------------------------
+// FIRTH FORK v2 · multi-company media capture (audio + image)
+//
+// Hooked from handleMessage when mediaType ∈ {"audio", "image"}. Computes
+// destination via targetMediaPath() (which reads routing.json), downloads
+// the media, writes the binary + `.meta.json` sidecar. For self-chat (Mateo)
+// the v1 saveVoiceCaptureAudio path is used instead (preserves audios_raw
+// + .chat_jid sidecar contract).
+// ---------------------------------------------------------------------------
+
+func saveMediaCapture(client *whatsmeow.Client, msg *events.Message, mediaType string, logger waLog.Logger) {
+	if msg == nil || msg.Message == nil {
+		return
+	}
+
+	chatJID := msg.Info.Chat.String()
+	senderJID := msg.Info.Sender.String()
+
+	// FIRTH FORK · no descargar fuentes no-conversacionales: estados/historias
+	// (status@broadcast), listas de difusión (@broadcast) y newsletters
+	// (@newsletter). Pedido de Mateo 2026-06-01: dejaban basura en _unmapped.
+	if chatJID == "status@broadcast" ||
+		strings.HasSuffix(chatJID, "@broadcast") ||
+		strings.HasSuffix(chatJID, "@newsletter") {
+		return
+	}
+
+	// Resolve the downloadable + extension before deciding the path.
+	var (
+		downloader *MediaDownloader
+		ext        string
+	)
+	switch mediaType {
+	case "audio":
+		aud := msg.Message.GetAudioMessage()
+		if aud == nil {
+			return
+		}
+		ext = mediaExtensionFromType("audio", aud.GetMimetype())
+		downloader = &MediaDownloader{
+			URL:           aud.GetURL(),
+			DirectPath:    extractDirectPathFromURL(aud.GetURL()),
+			MediaKey:      aud.GetMediaKey(),
+			FileLength:    aud.GetFileLength(),
+			FileSHA256:    aud.GetFileSHA256(),
+			FileEncSHA256: aud.GetFileEncSHA256(),
+			MediaType:     whatsmeow.MediaAudio,
+		}
+	case "image":
+		img := msg.Message.GetImageMessage()
+		if img == nil {
+			return
+		}
+		ext = mediaExtensionFromType("image", img.GetMimetype())
+		downloader = &MediaDownloader{
+			URL:           img.GetURL(),
+			DirectPath:    extractDirectPathFromURL(img.GetURL()),
+			MediaKey:      img.GetMediaKey(),
+			FileLength:    img.GetFileLength(),
+			FileSHA256:    img.GetFileSHA256(),
+			FileEncSHA256: img.GetFileEncSHA256(),
+			MediaType:     whatsmeow.MediaImage,
+		}
+	default:
+		return
+	}
+
+	// Compute destination path via routing layer.
+	repoRoot := resolveRepoRoot()
+	dest := targetMediaPath(chatJID, senderJID, mediaType, msg.Info.ID, ext, repoRoot, msg.Info.Timestamp)
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		logger.Warnf("[voice_capture-v2] mkdir failed for %s: %v", filepath.Dir(dest), err)
+		return
+	}
+
+	data, err := client.Download(context.Background(), downloader)
+	if err != nil {
+		logger.Warnf("[voice_capture-v2] download failed for msg %s in %s: %v",
+			msg.Info.ID, chatJID, err)
+		return
+	}
+
+	if err := os.WriteFile(dest, data, 0644); err != nil {
+		logger.Warnf("[voice_capture-v2] write failed at %s: %v", dest, err)
+		return
+	}
+
+	// Resolve company slug for the sidecar (only meaningful for non-self-chat paths).
+	companySlug, _, _ := routeMediaTarget(chatJID, senderJID)
+
+	meta := map[string]interface{}{
+		"chat_jid":      chatJID,
+		"sender_jid":    senderJID,
+		"media_type":    mediaType,
+		"timestamp_iso": msg.Info.Timestamp.Format(time.RFC3339),
+		"msg_id_full":   msg.Info.ID,
+		"company_slug":  companySlug,
+	}
+	metaPath := dest + ".meta.json"
+	if metaBytes, mErr := json.MarshalIndent(meta, "", "  "); mErr == nil {
+		if wErr := os.WriteFile(metaPath, metaBytes, 0644); wErr != nil {
+			logger.Warnf("[voice_capture-v2] meta sidecar write failed at %s: %v", metaPath, wErr)
+		}
+	}
+
+	absPath, _ := filepath.Abs(dest)
+	fmt.Printf("[voice_capture-v2] saved %d bytes (%s) -> %s (chat=%s sender=%s company=%s)\n",
+		len(data), mediaType, absPath, chatJID, senderJID, companySlug)
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
@@ -467,6 +671,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+	}
+
+	// FIRTH FORK · voice_capture hooks — non-blocking.
+	//
+	// v1 legacy: audio in self-chat (or any chat in VOICE_CAPTURE_ALLOWED_CHATS)
+	// still goes to automations/voice_capture/audios_raw/<msg_id>.ogg with the
+	// .chat_jid sidecar, so the existing Python pipeline keeps working.
+	//
+	// v2 multi-company: every audio/image is also routed via routing.json
+	// (loaded from VOICE_CAPTURE_ROUTING_JSON) to per-company _media/ dirs.
+	// Self-chat is skipped in v2 to avoid double-write; image messages in
+	// allow-listed chats also go through v2 since v1 only handled audio.
+	if mediaType == "audio" && isVoiceCaptureChat(chatJID) {
+		go saveVoiceCaptureAudio(client, msg, logger)
+	}
+	if (mediaType == "audio" || mediaType == "image") && !isSelfChat(chatJID) {
+		go saveMediaCapture(client, msg, mediaType, logger)
 	}
 }
 
@@ -641,7 +862,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +1021,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -871,8 +1092,18 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Tambien escribir el string raw del QR a un archivo para que Python
+				// pueda regenerarlo como PNG en terminales que no renderizan Unicode bien.
+				// Patch Firth 2026-05-13 (Mateo + Claude).
+				if err := os.WriteFile("store/qr_current.txt", []byte(evt.Code), 0644); err != nil {
+					logger.Warnf("Could not write QR string to store/qr_current.txt: %v", err)
+				} else {
+					fmt.Println("[QR_RAW_WRITTEN] store/qr_current.txt")
+				}
 			} else if evt.Event == "success" {
 				connected <- true
+				// Limpiar el QR file al lograr pairing
+				_ = os.Remove("store/qr_current.txt")
 				break
 			}
 		}
@@ -973,7 +1204,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1219,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1081,18 +1312,27 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Determine sender
+				// Fix (Firth): para mensajes de grupo en history sync, Key.Participant
+				// viene nil — toca caer a WebMessageInfo.Participant antes de usar el
+				// chat JID como sender (que rompe la identificacion del autor).
 				var sender string
 				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
+				if msg.Message.Key != nil && msg.Message.Key.FromMe != nil {
+					isFromMe = *msg.Message.Key.FromMe
+				}
+				if isFromMe {
+					sender = client.Store.ID.User
+				} else if msg.Message.Key != nil && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+					if pjid, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
+						sender = pjid.User
 					} else {
-						sender = jid.User
+						sender = *msg.Message.Key.Participant
+					}
+				} else if msg.Message.Participant != nil && *msg.Message.Participant != "" {
+					if pjid, perr := types.ParseJID(*msg.Message.Participant); perr == nil {
+						sender = pjid.User
+					} else {
+						sender = *msg.Message.Participant
 					}
 				} else {
 					sender = jid.User
