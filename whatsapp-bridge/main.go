@@ -528,6 +528,16 @@ func saveMediaCapture(client *whatsmeow.Client, msg *events.Message, mediaType s
 		return
 	}
 
+	// FIRTH FORK · solo auto-descargar media de chats MAPEADOS a una empresa.
+	// Si la ruta cae en _unmapped (grupos / contactos sin override en
+	// routing.json), NO descargar: evita que _unmapped se llene de basura
+	// (gremio, comunidades, familia, desconocidos). La media de un chat se
+	// puede bajar on-demand vía MCP download_media si luego se mapea el
+	// contacto en contact_overrides.json. Pedido de Mateo 2026-06-01.
+	if _, _, mapped := routeMediaTarget(chatJID, senderJID); !mapped {
+		return
+	}
+
 	// Resolve the downloadable + extension before deciding the path.
 	var (
 		downloader *MediaDownloader
