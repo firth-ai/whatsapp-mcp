@@ -15,3 +15,4 @@ whatsapp-bridge-original/
 whatsapp-mcp-server/.venv/
 __pycache__/
 *.pyc
+whatsapp-bridge/*.exe.bak-*
