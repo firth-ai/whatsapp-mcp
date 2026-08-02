@@ -1,3 +1,17 @@
-*.db
-claude_desktop_config.json
-whatsapp.log
+# ── Ruido de ejecucion: nada de esto es codigo ──────────────────────
+whatsapp-bridge/store/
+whatsapp-bridge/*.exe
+whatsapp-bridge/*.log
+whatsapp-bridge/*.pid
+whatsapp-bridge/*.db
+whatsapp-bridge/*.db-shm
+whatsapp-bridge/*.db-wal
+
+# Copia intacta del upstream que se guarda para comparar. Ya vive en el
+# historial de lharries/whatsapp-mcp — no hay que duplicarla.
+whatsapp-bridge-original/
+
+# Python del MCP server
+whatsapp-mcp-server/.venv/
+__pycache__/
+*.pyc
