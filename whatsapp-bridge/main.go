@@ -738,6 +738,28 @@ type DownloadMediaRequest struct {
 	ChatJID   string `json:"chat_jid"`
 }
 
+// GroupMember is one participant of a group, as returned by /api/group_members
+type GroupMember struct {
+	JID          string `json:"jid"`
+	LID          string `json:"lid,omitempty"`
+	Phone        string `json:"phone,omitempty"`
+	FullName     string `json:"full_name,omitempty"`
+	PushName     string `json:"push_name,omitempty"`
+	DisplayName  string `json:"display_name,omitempty"`
+	IsAdmin      bool   `json:"is_admin"`
+	IsSuperAdmin bool   `json:"is_super_admin"`
+}
+
+// GroupMembersResponse is the body of /api/group_members
+type GroupMembersResponse struct {
+	JID          string        `json:"jid"`
+	Name         string        `json:"name"`
+	Topic        string        `json:"topic,omitempty"`
+	IsAnnounce   bool          `json:"is_announce"`
+	IsCommunity  bool          `json:"is_community"`
+	Participants []GroupMember `json:"participants"`
+}
+
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
 	Success  bool   `json:"success"`
@@ -978,6 +1000,70 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+		})
+	})
+
+	// Handler for listing the members of a group, including the ones that never write.
+	// GET /api/group_members?jid=<id>@g.us
+	http.HandleFunc("/api/group_members", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jid, err := types.ParseJID(r.URL.Query().Get("jid"))
+		if err != nil || jid.Server != types.GroupServer {
+			http.Error(w, "jid must be a group JID (<id>@g.us)", http.StatusBadRequest)
+			return
+		}
+
+		ctx := context.Background()
+		info, err := client.GetGroupInfo(ctx, jid)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("GetGroupInfo failed: %v", err), http.StatusBadGateway)
+			return
+		}
+
+		members := make([]GroupMember, 0, len(info.Participants))
+		for _, p := range info.Participants {
+			m := GroupMember{
+				JID:          p.JID.String(),
+				IsAdmin:      p.IsAdmin,
+				IsSuperAdmin: p.IsSuperAdmin,
+				DisplayName:  p.DisplayName,
+			}
+			if !p.LID.IsEmpty() {
+				m.LID = p.LID.String()
+			}
+			// Phone: explicit field, else the JID itself, else the LID→PN map.
+			switch {
+			case !p.PhoneNumber.IsEmpty():
+				m.Phone = p.PhoneNumber.User
+			case p.JID.Server == types.DefaultUserServer:
+				m.Phone = p.JID.User
+			case p.JID.Server == types.HiddenUserServer:
+				if pn, err := client.Store.LIDs.GetPNForLID(ctx, p.JID); err == nil && !pn.IsEmpty() {
+					m.Phone = pn.User
+				}
+			}
+			lookup := p.JID
+			if m.Phone != "" {
+				lookup = types.NewJID(m.Phone, types.DefaultUserServer)
+			}
+			if c, err := client.Store.Contacts.GetContact(ctx, lookup); err == nil {
+				m.FullName = c.FullName
+				m.PushName = c.PushName
+			}
+			members = append(members, m)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(GroupMembersResponse{
+			JID:          jid.String(),
+			Name:         info.Name,
+			Topic:        info.Topic,
+			IsAnnounce:   info.IsAnnounce,
+			IsCommunity:  info.IsParent,
+			Participants: members,
 		})
 	})
 
